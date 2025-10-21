@@ -168,25 +168,80 @@ class ObsidianIntegration:
         """
         Mark task as complete in Obsidian task database
 
+        Finds the task by title and changes `- [ ]` to `- [x]`.
+        Uses fuzzy matching to handle minor variations in task text.
+
         Args:
-            task_text: Text of task to mark complete
+            task_text: Text of task to mark complete (just the title, no tags)
 
         Returns:
             True if successful, False otherwise
-
-        TODO: Implement in Increment 8
-        - Find task in task_database.md
-        - Change [ ] to [x]
-        - Optionally move to archive section
-        - Write file back
         """
+        from difflib import SequenceMatcher
+
         if not self.task_database.exists():
+            self.logger.error(f"Task database not found: {self.task_database}")
             return False
 
         self.logger.info(f"Marking Obsidian task complete: {task_text[:50]}...")
 
-        # TODO: Implement task completion
-        return False
+        try:
+            # Read current content
+            content = self.task_database.read_text()
+            lines = content.split('\n')
+
+            # Find matching task line
+            best_match_idx = None
+            best_similarity = 0.0
+            threshold = 0.85  # 85% similarity required
+
+            for i, line in enumerate(lines):
+                # Only look at uncompleted tasks
+                if not line.strip().startswith('- [ ]'):
+                    continue
+
+                # Extract task text (remove checkbox and tags)
+                task_line = line.replace('- [ ]', '').strip()
+                # Remove all tags
+                task_line_clean = re.sub(r'#[\w/:\-()]+', '', task_line).strip()
+
+                # Compare to input
+                similarity = SequenceMatcher(
+                    None,
+                    task_text.lower().strip(),
+                    task_line_clean.lower().strip()
+                ).ratio()
+
+                if similarity > best_similarity and similarity >= threshold:
+                    best_similarity = similarity
+                    best_match_idx = i
+
+            if best_match_idx is None:
+                self.logger.warning(
+                    f"No matching task found for: {task_text[:50]}...\n"
+                    f"(searched with {threshold*100}% similarity threshold)"
+                )
+                return False
+
+            # Mark task complete
+            original_line = lines[best_match_idx]
+            completed_line = original_line.replace('- [ ]', '- [x]', 1)
+            lines[best_match_idx] = completed_line
+
+            # Write back to file
+            new_content = '\n'.join(lines)
+            self.task_database.write_text(new_content)
+
+            self.logger.info(
+                f"✅ Marked complete in Obsidian (similarity: {best_similarity:.2f})\n"
+                f"   Changed: {original_line.strip()[:70]}..."
+            )
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to mark task complete: {e}")
+            return False
 
     def _get_daily_note_path(self, date: datetime) -> Path:
         """Get path to daily note for specified date"""

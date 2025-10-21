@@ -90,23 +90,60 @@ class TodoistIntegration:
         """
         Mark task as complete in Todoist
 
+        Note: This method writes a completion request to cache/todoist_completions.json.
+        Claude Code should monitor this file and execute completions via MCP.
+
+        Architecture:
+        1. Python writes completion request to cache file
+        2. Claude Code monitors file (or user runs sync command)
+        3. Claude Code calls mcp__todoist__close_tasks
+        4. Cache is updated to reflect completion
+
         Args:
-            task_id: Todoist task ID
+            task_id: Todoist task ID (without 'todoist_' prefix)
 
         Returns:
-            True if successful, False otherwise
-
-        TODO: Implement in Increment 7
+            True if request written successfully, False otherwise
         """
         if not self.enabled:
             return False
 
+        # Remove 'todoist_' prefix if present
+        if task_id.startswith('todoist_'):
+            task_id = task_id.replace('todoist_', '')
+
         self.logger.info(f"Marking Todoist task {task_id} complete...")
 
-        # TODO: Implement MCP integration
-        # return mcp_todoist.close_tasks([{"task_id": task_id}])
+        try:
+            # Load existing completion requests
+            completions_file = self.cache_dir / 'todoist_completions.json'
+            completions = []
 
-        return False
+            if completions_file.exists():
+                with open(completions_file, 'r') as f:
+                    completions = json.load(f)
+
+            # Add new completion request
+            completions.append({
+                'task_id': task_id,
+                'requested_at': datetime.now().isoformat(),
+                'status': 'pending'
+            })
+
+            # Write back to file
+            with open(completions_file, 'w') as f:
+                json.dump(completions, f, indent=2)
+
+            self.logger.info(
+                f"✅ Completion request queued for task {task_id}\n"
+                f"Run `task-manager sync` or ask Claude Code to process completions"
+            )
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to queue completion: {e}")
+            return False
 
     def _parse_todoist_tasks(self, raw_tasks: List[Dict]) -> List[Dict[str, Any]]:
         """

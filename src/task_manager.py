@@ -496,21 +496,75 @@ class TaskManager:
 
         Args:
             task_id: Unique task identifier
-            systems: List of systems to update (default: all source systems)
+            systems: List of systems to update (default: all source systems for that task)
 
         Returns:
-            True if successful, False otherwise
+            True if at least one system updated successfully, False otherwise
         """
         self.logger.info(f"Marking task {task_id} complete...")
 
-        # TODO: Implement in Increment 7-8
-        # - Find task by ID
-        # - Determine which systems it came from
-        # - Update Todoist via MCP
-        # - Update Obsidian task database
-        # - Archive if configured
+        # Get all tasks to find this one
+        all_tasks = self.aggregate_tasks()
 
-        return False
+        # Find the task
+        target_task = None
+        for task in all_tasks:
+            if task.id == task_id:
+                target_task = task
+                break
+
+        if not target_task:
+            self.logger.error(f"Task not found: {task_id}")
+            return False
+
+        # Determine which systems to update
+        if systems is None:
+            systems = target_task.source_systems
+
+        self.logger.info(
+            f"Marking '{target_task.title[:50]}' complete in: {', '.join(systems)}"
+        )
+
+        # Track success
+        success_count = 0
+        total_count = len(systems)
+
+        # Update each system
+        for system in systems:
+            if system == 'todoist':
+                if self._todoist and self._todoist.mark_complete(task_id):
+                    success_count += 1
+                    self.logger.info(f"✅ Marked complete in Todoist")
+                else:
+                    self.logger.warning(f"⚠️  Failed to mark complete in Todoist")
+
+            elif system == 'obsidian':
+                if self._obsidian.mark_complete(target_task.title):
+                    success_count += 1
+                    self.logger.info(f"✅ Marked complete in Obsidian")
+                else:
+                    self.logger.warning(f"⚠️  Failed to mark complete in Obsidian")
+
+            elif system == 'daily_note':
+                # Daily note tasks are transient - just log
+                self.logger.info(f"ℹ️  Daily note tasks are transient (no action needed)")
+                success_count += 1
+
+            else:
+                self.logger.warning(f"Unknown system: {system}")
+
+        # Report results
+        if success_count == total_count:
+            self.logger.info(f"✅ Task marked complete in all {total_count} systems")
+            return True
+        elif success_count > 0:
+            self.logger.warning(
+                f"⚠️  Task marked complete in {success_count}/{total_count} systems"
+            )
+            return True
+        else:
+            self.logger.error(f"❌ Failed to mark task complete in any system")
+            return False
 
     def cleanup_stale_tasks(self) -> List[Task]:
         """
@@ -640,6 +694,7 @@ def main():
             print("=" * 60)
             for i, task in enumerate(critical_tasks, 1):
                 print(f"\n{i}. [{task.priority}] {task.title}")
+                print(f"   ID: {task.id}")
                 print(f"   Attention Tax: {task.attention_tax:.1f}")
                 print(f"   Energy: {task.energy}, Attention: {task.attention}")
                 if task.due_date:
@@ -662,6 +717,7 @@ def main():
         print("(Sorted by Attention Tax: lowest first = easiest wins)\n")
         for i, task in enumerate(recommended_tasks, 1):
             print(f"{i}. [{task.priority}] {task.title}")
+            print(f"   ID: {task.id}")
             print(f"   Attention Tax: {task.attention_tax:.1f}")
             print(f"   Energy: {task.energy}, Attention: {task.attention}")
             if task.due_date:
