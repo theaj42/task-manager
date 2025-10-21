@@ -332,6 +332,21 @@ class TaskManager:
         all_tasks = self.aggregate_tasks()
         all_tasks = self.deduplicate_tasks(all_tasks)
 
+        # Filter out backlog tasks (deferred for future consideration)
+        backlog_count = 0
+        filtered_tasks = []
+        for task in all_tasks:
+            raw_line = task.metadata.get('raw_line', '') if task.metadata else ''
+            if '#backlog' not in raw_line:
+                filtered_tasks.append(task)
+            else:
+                backlog_count += 1
+
+        if backlog_count > 0:
+            self.logger.info(f"Filtered out {backlog_count} backlog tasks from recommendations")
+
+        all_tasks = filtered_tasks
+
         # Calculate attention tax for each
         for task in all_tasks:
             task.attention_tax = self.calculate_attention_tax(task)
