@@ -151,7 +151,12 @@ class TaskManager:
 
     def deduplicate_tasks(self, tasks: List[Task]) -> List[Task]:
         """
-        Deduplicate tasks using task_deduplicator agent
+        Deduplicate tasks using heuristic matching
+
+        Strategy:
+        1. Exact title match → merge immediately
+        2. Fuzzy match (>80% similar) → merge
+        3. For duplicates: merge source_systems, combine metadata
 
         Args:
             tasks: List of tasks potentially containing duplicates
@@ -159,14 +164,85 @@ class TaskManager:
         Returns:
             List of unique tasks
         """
+        from difflib import SequenceMatcher
+
+        if not tasks:
+            return []
+
         self.logger.info(f"Deduplicating {len(tasks)} tasks...")
 
-        # TODO: Implement in Increment 4
-        # - Import task_deduplicator from AI-assistant
-        # - Run deduplication
-        # - Merge source_systems for duplicates
+        # Track unique tasks and duplicates
+        unique_tasks = []
+        merged_count = 0
 
-        return tasks
+        for task in tasks:
+            # Check if this task is a duplicate of an existing unique task
+            is_duplicate = False
+
+            for unique_task in unique_tasks:
+                # Check for exact match (case-insensitive)
+                if task.title.lower().strip() == unique_task.title.lower().strip():
+                    # Exact match - merge source systems
+                    self._merge_duplicate(unique_task, task)
+                    is_duplicate = True
+                    merged_count += 1
+                    self.logger.debug(f"Exact match: '{task.title[:40]}' (merged into existing)")
+                    break
+
+                # Check for fuzzy match (80% similarity threshold)
+                similarity = SequenceMatcher(
+                    None,
+                    task.title.lower().strip(),
+                    unique_task.title.lower().strip()
+                ).ratio()
+
+                if similarity >= 0.80:
+                    # High similarity - merge
+                    self._merge_duplicate(unique_task, task)
+                    is_duplicate = True
+                    merged_count += 1
+                    self.logger.debug(
+                        f"Fuzzy match ({similarity:.2f}): "
+                        f"'{task.title[:40]}' ≈ '{unique_task.title[:40]}' (merged)"
+                    )
+                    break
+
+            # If not a duplicate, add to unique list
+            if not is_duplicate:
+                unique_tasks.append(task)
+
+        self.logger.info(
+            f"Deduplication complete: {len(tasks)} → {len(unique_tasks)} "
+            f"({merged_count} duplicates merged)"
+        )
+
+        return unique_tasks
+
+    def _merge_duplicate(self, existing: Task, duplicate: Task) -> None:
+        """
+        Merge a duplicate task into an existing task
+
+        Combines source_systems and metadata. Keeps existing task's primary fields.
+
+        Args:
+            existing: The task to merge into (modified in-place)
+            duplicate: The duplicate task to merge from
+        """
+        # Merge source systems (unique values only)
+        for source in duplicate.source_systems:
+            if source not in existing.source_systems:
+                existing.source_systems.append(source)
+
+        # Merge metadata (preserve both)
+        if duplicate.metadata:
+            if 'merged_from' not in existing.metadata:
+                existing.metadata['merged_from'] = []
+
+            existing.metadata['merged_from'].append({
+                'title': duplicate.title,
+                'sources': duplicate.source_systems,
+                'metadata': duplicate.metadata
+            })
 
     def get_current_capacity(self) -> Capacity:
         """
@@ -455,9 +531,24 @@ class TaskManager:
     # ==================== Integration Methods ====================
 
     def _get_todoist_tasks(self) -> List[Task]:
-        """Get tasks from Todoist via MCP"""
-        # TODO: Implement in Increment 1
-        return []
+        """Get tasks from Todoist via cache"""
+        raw_tasks = self._todoist.get_tasks()
+
+        tasks = []
+        for raw in raw_tasks:
+            task = Task(
+                id=raw['id'],
+                title=raw['title'],
+                priority=raw['priority'],
+                energy=raw['energy'],
+                attention=raw['attention'],
+                due_date=raw['due_date'],
+                source_systems=raw['source_systems'],
+                metadata=raw['metadata']
+            )
+            tasks.append(task)
+
+        return tasks
 
     def _get_obsidian_tasks(self) -> List[Task]:
         """Get tasks from Obsidian task database"""
