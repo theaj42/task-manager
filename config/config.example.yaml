@@ -1,0 +1,55 @@
+# task-manager configuration
+# Copy this file to config.yaml and customize
+
+# Obsidian vault settings
+obsidian:
+  vault_path: "~/Dropbox/DropsyncFiles/git/obsidian/base_vault"
+  task_database: "80 - Tasks/81 - Task Database/task_database.md"
+  daily_notes_path: "1 - Daily"
+  daily_note_format: "%Y-%m-%d"  # YYYY-MM-DD.md
+
+# Todoist settings (via MCP)
+todoist:
+  enabled: true
+  # MCP server handles authentication
+  # No API key needed here
+
+# AI-assistant integration
+ai_assistant:
+  base_path: "~/AI-assistant"
+  task_deduplicator: "tools/agents/task_deduplicator.py"
+
+# Attention Tax scoring (Obsidian formula)
+attention_tax:
+  priority_base:
+    P1: 5
+    P2: 4
+    P3: 3
+    P4: 2
+  energy_multiplier:
+    high: 2.0
+    medium: 1.5
+    low: 1.0
+  deadline_multiplier:
+    has_deadline: 1.5
+    no_deadline: 1.0
+
+# Recommendation settings
+recommendations:
+  max_tasks: 5
+  min_tasks: 3
+  # Capacity matching thresholds
+  energy_match_weight: 0.4
+  attention_match_weight: 0.4
+  priority_weight: 0.2
+
+# Maintenance settings
+maintenance:
+  stale_task_days: 30  # Flag tasks with no activity
+  auto_archive_completed: true
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/task-manager.log"
+  console: true
