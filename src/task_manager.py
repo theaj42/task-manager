@@ -64,9 +64,11 @@ class TaskManager:
         self.project_root = self._detect_project_root()
         self.config = self._load_config(config_path)
 
-        # Initialize integrations (lazy loaded)
-        self._todoist = None
-        self._obsidian = None
+        # Initialize integrations
+        from integrations import ObsidianIntegration, TodoistIntegration
+
+        self._obsidian = ObsidianIntegration(self.config['obsidian'])
+        self._todoist = TodoistIntegration(self.config['todoist']) if self.config['todoist']['enabled'] else None
 
         self.logger.info("✅ TaskManager initialized successfully")
 
@@ -134,10 +136,15 @@ class TaskManager:
         self.logger.info("Aggregating tasks from all sources...")
         tasks = []
 
-        # TODO: Implement in Increment 1-3
-        # tasks.extend(self._get_todoist_tasks())
-        # tasks.extend(self._get_obsidian_tasks())
-        # tasks.extend(self._get_daily_note_tasks())
+        # Get tasks from Obsidian
+        tasks.extend(self._get_obsidian_tasks())
+
+        # Get tasks from Todoist (if enabled)
+        if self._todoist and self.config['todoist']['enabled']:
+            tasks.extend(self._get_todoist_tasks())
+
+        # Get tasks from daily note
+        tasks.extend(self._get_daily_note_tasks())
 
         self.logger.info(f"Found {len(tasks)} total tasks")
         return tasks
@@ -170,13 +177,12 @@ class TaskManager:
         """
         self.logger.info("Reading current capacity from daily note...")
 
-        # TODO: Implement in Increment 3
-        # - Read today's daily note
-        # - Parse "How I'm Feeling" section
-        # - Extract energy and attention levels
+        capacity_dict = self._obsidian.get_current_capacity()
 
-        # Default to medium/medium if not found
-        return Capacity(energy="medium", attention="medium")
+        return Capacity(
+            energy=capacity_dict['energy'],
+            attention=capacity_dict['attention']
+        )
 
     def calculate_attention_tax(self, task: Task) -> float:
         """
@@ -189,6 +195,10 @@ class TaskManager:
 
         Returns:
             Attention Tax score
+
+        Example:
+            P1 task + high energy + has deadline = 5 × 2.0 × 1.5 = 15.0
+            P3 task + low energy + no deadline = 3 × 1.0 × 1.0 = 3.0
         """
         config = self.config['attention_tax']
 
@@ -205,7 +215,14 @@ class TaskManager:
             else config['deadline_multiplier']['no_deadline']
         )
 
-        return priority_score * energy_mult * deadline_mult
+        score = priority_score * energy_mult * deadline_mult
+
+        self.logger.debug(
+            f"Attention Tax for '{task.title[:30]}': "
+            f"{priority_score} × {energy_mult} × {deadline_mult} = {score}"
+        )
+
+        return score
 
     def recommend_next_actions(
         self,
@@ -220,7 +237,7 @@ class TaskManager:
             max_tasks: Maximum tasks to return (default from config)
 
         Returns:
-            List of recommended tasks sorted by Attention Tax
+            List of recommended tasks sorted by Attention Tax, filtered by capacity match
         """
         if capacity is None:
             capacity = self.get_current_capacity()
@@ -242,17 +259,82 @@ class TaskManager:
             task.attention_tax = self.calculate_attention_tax(task)
 
         # Filter by capacity match
-        # TODO: Implement smart filtering in Increment 6
-        matched_tasks = all_tasks
+        matched_tasks = self._filter_by_capacity(all_tasks, capacity)
+
+        self.logger.info(
+            f"Filtered to {len(matched_tasks)} tasks matching capacity "
+            f"(from {len(all_tasks)} total)"
+        )
 
         # Sort by Attention Tax (highest first)
         matched_tasks.sort(key=lambda t: t.attention_tax, reverse=True)
 
         # Return top N
+        min_tasks = self.config['recommendations']['min_tasks']
         recommendations = matched_tasks[:max_tasks]
+
+        # If we don't have enough matches, fill with highest priority regardless of capacity
+        if len(recommendations) < min_tasks:
+            self.logger.info(
+                f"Only {len(recommendations)} capacity matches, "
+                f"adding high-priority tasks to reach minimum of {min_tasks}"
+            )
+            all_tasks.sort(key=lambda t: t.attention_tax, reverse=True)
+            for task in all_tasks:
+                if task not in recommendations:
+                    recommendations.append(task)
+                    if len(recommendations) >= min_tasks:
+                        break
 
         self.logger.info(f"Recommended {len(recommendations)} tasks")
         return recommendations
+
+    def _filter_by_capacity(self, tasks: List[Task], capacity: Capacity) -> List[Task]:
+        """
+        Filter tasks to those matching current energy/attention capacity
+
+        Strategy:
+        - Exact match (same energy AND attention): highest priority
+        - Energy match OR attention match: medium priority
+        - No match but one level off: acceptable
+        - Two levels off: exclude
+
+        Args:
+            tasks: List of all tasks
+            capacity: Current capacity
+
+        Returns:
+            Tasks that match or are close to current capacity
+        """
+        energy_levels = {'low': 0, 'medium': 1, 'high': 2}
+        attention_levels = {'low': 0, 'medium': 1, 'high': 2}
+
+        capacity_energy_level = energy_levels[capacity.energy]
+        capacity_attention_level = attention_levels[capacity.attention]
+
+        matched = []
+
+        for task in tasks:
+            task_energy_level = energy_levels[task.energy]
+            task_attention_level = attention_levels[task.attention]
+
+            # Calculate distance from current capacity
+            energy_diff = abs(task_energy_level - capacity_energy_level)
+            attention_diff = abs(task_attention_level - capacity_attention_level)
+
+            # Accept if:
+            # - Exact match (diff = 0 for both)
+            # - One dimension matches and other is within 1 level
+            # - Both within 1 level
+            if energy_diff <= 1 and attention_diff <= 1:
+                matched.append(task)
+                self.logger.debug(
+                    f"Match: '{task.title[:30]}' "
+                    f"(task: {task.energy}/{task.attention}, "
+                    f"capacity: {capacity.energy}/{capacity.attention})"
+                )
+
+        return matched
 
     def mark_complete(self, task_id: str, systems: Optional[List[str]] = None) -> bool:
         """
@@ -301,13 +383,43 @@ class TaskManager:
 
     def _get_obsidian_tasks(self) -> List[Task]:
         """Get tasks from Obsidian task database"""
-        # TODO: Implement in Increment 2
-        return []
+        raw_tasks = self._obsidian.get_tasks()
+
+        tasks = []
+        for raw in raw_tasks:
+            task = Task(
+                id=raw['id'],
+                title=raw['title'],
+                priority=raw['priority'],
+                energy=raw['energy'],
+                attention=raw['attention'],
+                due_date=raw['due_date'],
+                source_systems=raw['source_systems'],
+                metadata=raw['metadata']
+            )
+            tasks.append(task)
+
+        return tasks
 
     def _get_daily_note_tasks(self) -> List[Task]:
         """Get tasks from today's daily note action items"""
-        # TODO: Implement in Increment 3
-        return []
+        raw_tasks = self._obsidian.get_daily_note_tasks()
+
+        tasks = []
+        for raw in raw_tasks:
+            task = Task(
+                id=raw['id'],
+                title=raw['title'],
+                priority=raw['priority'],
+                energy=raw['energy'],
+                attention=raw['attention'],
+                due_date=raw['due_date'],
+                source_systems=raw['source_systems'],
+                metadata=raw['metadata']
+            )
+            tasks.append(task)
+
+        return tasks
 
 
 # ==================== CLI Interface ====================
