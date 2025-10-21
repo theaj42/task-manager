@@ -566,21 +566,56 @@ class TaskManager:
             self.logger.error(f"❌ Failed to mark task complete in any system")
             return False
 
-    def cleanup_stale_tasks(self) -> List[Task]:
+    def cleanup_stale_tasks(self, stale_threshold_days: Optional[int] = None) -> List[Task]:
         """
-        Find tasks with no activity in 30+ days
+        Find stale tasks that may need review
+
+        A task is considered stale if:
+        - It has a due date that's more than threshold days overdue
+        - This indicates the task was likely forgotten or is no longer relevant
+
+        Args:
+            stale_threshold_days: Days overdue to consider stale (default from config)
 
         Returns:
-            List of stale tasks flagged for review
+            List of stale tasks sorted by staleness (oldest first)
         """
-        self.logger.info("Finding stale tasks...")
+        if stale_threshold_days is None:
+            stale_threshold_days = self.config.get('cleanup', {}).get('stale_threshold_days', 30)
 
-        # TODO: Implement in Increment 10
-        # - Get all tasks
-        # - Check last modified date
-        # - Flag tasks older than config threshold
+        self.logger.info(f"Finding tasks overdue by {stale_threshold_days}+ days...")
 
-        return []
+        # Get all tasks
+        all_tasks = self.aggregate_tasks()
+        deduplicated_tasks = self.deduplicate_tasks(all_tasks)
+
+        # Find stale tasks
+        stale_tasks = []
+        now = datetime.now()
+
+        for task in deduplicated_tasks:
+            # Only consider tasks with due dates
+            if not task.due_date:
+                continue
+
+            # Calculate days overdue
+            days_overdue = (now - task.due_date).days
+
+            # Flag if overdue by threshold or more
+            if days_overdue >= stale_threshold_days:
+                task.attention_tax = self.calculate_attention_tax(task)
+                task.metadata['days_overdue'] = days_overdue
+                stale_tasks.append(task)
+                self.logger.info(
+                    f"Stale task: '{task.title[:40]}' (overdue by {days_overdue} days)"
+                )
+
+        # Sort by days overdue (oldest first)
+        stale_tasks.sort(key=lambda t: t.metadata['days_overdue'], reverse=True)
+
+        self.logger.info(f"Found {len(stale_tasks)} stale tasks (overdue by {stale_threshold_days}+ days)")
+
+        return stale_tasks
 
     # ==================== Integration Methods ====================
 
@@ -656,7 +691,7 @@ def main():
     )
     parser.add_argument(
         'command',
-        choices=['recommend', 'list', 'complete', 'cleanup'],
+        choices=['recommend', 'list', 'status', 'complete', 'cleanup'],
         help='Command to execute'
     )
     parser.add_argument(
@@ -667,6 +702,23 @@ def main():
         '--max-tasks',
         type=int,
         help='Maximum tasks to return (for recommend command)'
+    )
+    parser.add_argument(
+        '--source',
+        choices=['obsidian', 'todoist', 'daily_note', 'all'],
+        default='all',
+        help='Filter tasks by source (for list command)'
+    )
+    parser.add_argument(
+        '--priority',
+        choices=['P1', 'P2', 'P3', 'P4', 'all'],
+        default='all',
+        help='Filter tasks by priority (for list command)'
+    )
+    parser.add_argument(
+        '--stale-threshold',
+        type=int,
+        help='Days overdue to consider stale (for cleanup command, default: 30)'
     )
     parser.add_argument(
         '--config',
@@ -726,10 +778,144 @@ def main():
             print()
 
     elif args.command == 'list':
-        tasks = agent.aggregate_tasks()
-        print(f"\n📋 All Tasks ({len(tasks)}):\n")
-        for task in tasks:
-            print(f"- [{task.priority}] {task.title}")
+        # Get all tasks
+        all_tasks = agent.aggregate_tasks()
+        deduplicated_tasks = agent.deduplicate_tasks(all_tasks)
+
+        # Apply filters
+        filtered_tasks = deduplicated_tasks
+
+        # Filter by source
+        if args.source != 'all':
+            filtered_tasks = [t for t in filtered_tasks if args.source in t.source_systems]
+
+        # Filter by priority
+        if args.priority != 'all':
+            filtered_tasks = [t for t in filtered_tasks if t.priority == args.priority]
+
+        # Calculate attention tax for sorting
+        for task in filtered_tasks:
+            task.attention_tax = agent.calculate_attention_tax(task)
+
+        # Group tasks by source system
+        by_source = {}
+        for task in filtered_tasks:
+            for source in task.source_systems:
+                if source not in by_source:
+                    by_source[source] = []
+                by_source[source].append(task)
+
+        # Display results
+        filter_desc = []
+        if args.source != 'all':
+            filter_desc.append(f"source={args.source}")
+        if args.priority != 'all':
+            filter_desc.append(f"priority={args.priority}")
+
+        filter_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
+
+        print(f"\n📋 ALL TASKS{filter_str}:")
+        print("=" * 60)
+        print(f"Total: {len(filtered_tasks)} tasks (after deduplication)")
+        print(f"Before deduplication: {len(all_tasks)} tasks\n")
+
+        # Show by source
+        for source in sorted(by_source.keys()):
+            source_tasks = by_source[source]
+            print(f"\n{source.upper()} ({len(source_tasks)} tasks):")
+            print("-" * 40)
+
+            # Sort by priority then attention tax
+            priority_order = {'P1': 0, 'P2': 1, 'P3': 2, 'P4': 3}
+            source_tasks.sort(key=lambda t: (priority_order.get(t.priority, 4), t.attention_tax))
+
+            for task in source_tasks:
+                print(f"\n  [{task.priority}] {task.title}")
+                print(f"  ID: {task.id}")
+                print(f"  Attention Tax: {task.attention_tax:.1f} | Energy: {task.energy} | Attention: {task.attention}")
+                if task.due_date:
+                    days_until = (task.due_date - datetime.now()).days
+                    if days_until < 0:
+                        print(f"  Due: {task.due_date.strftime('%Y-%m-%d')} (⚠️  OVERDUE by {abs(days_until)} days)")
+                    else:
+                        print(f"  Due: {task.due_date.strftime('%Y-%m-%d')} (in {days_until} days)")
+                if len(task.source_systems) > 1:
+                    print(f"  Also in: {', '.join([s for s in task.source_systems if s != source])}")
+
+    elif args.command == 'status':
+        # Get all tasks
+        all_tasks = agent.aggregate_tasks()
+        deduplicated_tasks = agent.deduplicate_tasks(all_tasks)
+
+        # Calculate stats
+        for task in deduplicated_tasks:
+            task.attention_tax = agent.calculate_attention_tax(task)
+
+        # Get current capacity
+        capacity = agent.get_current_capacity()
+
+        # Count by source
+        by_source = {}
+        for task in deduplicated_tasks:
+            for source in task.source_systems:
+                by_source[source] = by_source.get(source, 0) + 1
+
+        # Count by priority
+        by_priority = {}
+        for task in deduplicated_tasks:
+            by_priority[task.priority] = by_priority.get(task.priority, 0) + 1
+
+        # Count critical tasks
+        critical_tasks = agent._identify_critical_tasks(deduplicated_tasks)
+
+        # Count overdue tasks
+        now = datetime.now()
+        overdue_tasks = [t for t in deduplicated_tasks if t.due_date and t.due_date < now]
+
+        # Display status
+        print(f"\n📊 TASK MANAGER STATUS:")
+        print("=" * 60)
+
+        print(f"\n🗂️  TASK INVENTORY:")
+        print(f"   Total Tasks (before deduplication): {len(all_tasks)}")
+        print(f"   Total Tasks (after deduplication):  {len(deduplicated_tasks)}")
+        print(f"   Duplicates Merged: {len(all_tasks) - len(deduplicated_tasks)}")
+
+        print(f"\n📦 BY SOURCE:")
+        for source in sorted(by_source.keys()):
+            print(f"   {source.capitalize():<15} {by_source[source]:>3} tasks")
+
+        print(f"\n🎯 BY PRIORITY:")
+        for priority in ['P1', 'P2', 'P3', 'P4']:
+            count = by_priority.get(priority, 0)
+            if count > 0:
+                print(f"   {priority:<15} {count:>3} tasks")
+
+        print(f"\n⚡ CURRENT CAPACITY:")
+        print(f"   Energy:    {capacity.energy.capitalize()}")
+        print(f"   Attention: {capacity.attention.capitalize()}")
+        print(f"   (Read from today's daily note at {capacity.timestamp.strftime('%H:%M')})")
+
+        print(f"\n🚨 CRITICAL ALERTS:")
+        print(f"   Critical Tasks:  {len(critical_tasks)}")
+        print(f"   Overdue Tasks:   {len(overdue_tasks)}")
+
+        if overdue_tasks:
+            print(f"\n   Overdue items:")
+            for task in sorted(overdue_tasks, key=lambda t: t.due_date)[:5]:
+                days_overdue = (now - task.due_date).days
+                print(f"     • [{task.priority}] {task.title[:50]}")
+                print(f"       (overdue by {days_overdue} days)")
+
+        # Integration status
+        print(f"\n🔌 INTEGRATIONS:")
+        print(f"   Obsidian:  ✅ Connected")
+        if agent._todoist:
+            print(f"   Todoist:   ✅ Connected")
+        else:
+            print(f"   Todoist:   ⚪ Disabled")
+
+        print()
 
     elif args.command == 'complete':
         if not args.task_id:
@@ -742,10 +928,31 @@ def main():
             print(f"❌ Failed to mark task {args.task_id} complete")
 
     elif args.command == 'cleanup':
-        stale_tasks = agent.cleanup_stale_tasks()
-        print(f"\n🧹 Stale Tasks ({len(stale_tasks)}):\n")
-        for task in stale_tasks:
-            print(f"- [{task.priority}] {task.title}")
+        stale_tasks = agent.cleanup_stale_tasks(stale_threshold_days=args.stale_threshold)
+
+        threshold = args.stale_threshold or agent.config.get('cleanup', {}).get('stale_threshold_days', 30)
+
+        print(f"\n🧹 STALE TASKS (overdue by {threshold}+ days):")
+        print("=" * 60)
+        print(f"Found {len(stale_tasks)} stale tasks that may need review\n")
+
+        if not stale_tasks:
+            print("✅ No stale tasks found - everything is current!\n")
+        else:
+            print("These tasks are significantly overdue and may need attention:")
+            print("- Archive/delete if no longer relevant")
+            print("- Update due date if still important")
+            print("- Complete if finished but not marked\n")
+
+            for i, task in enumerate(stale_tasks, 1):
+                days_overdue = task.metadata['days_overdue']
+                print(f"{i}. [{task.priority}] {task.title}")
+                print(f"   ID: {task.id}")
+                print(f"   Due Date: {task.due_date.strftime('%Y-%m-%d')}")
+                print(f"   Days Overdue: {days_overdue} days (⚠️  {days_overdue // 30} months)")
+                print(f"   Attention Tax: {task.attention_tax:.1f}")
+                print(f"   Sources: {', '.join(task.source_systems)}")
+                print()
 
     return 0
 
