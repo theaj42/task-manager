@@ -566,6 +566,470 @@ class TaskManager:
             self.logger.error(f"❌ Failed to mark task complete in any system")
             return False
 
+    def sync_daily_note(self, date: Optional[datetime] = None) -> bool:
+        """
+        Sync task recommendations to today's daily note
+
+        Inserts/updates a ## Tasks section between ## Planning and ## Notes
+        with critical tasks and capacity-matched recommendations.
+
+        Args:
+            date: Date of daily note (default: today)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if date is None:
+            date = datetime.now()
+
+        daily_note_path = self._obsidian._get_daily_note_path(date)
+
+        if not daily_note_path.exists():
+            self.logger.error(f"Daily note not found: {daily_note_path}")
+            return False
+
+        self.logger.info(f"Syncing tasks to daily note: {daily_note_path.name}")
+
+        # Get recommendations
+        recommendations = self.recommend_next_actions()
+        critical_tasks = recommendations['critical']
+        recommended_tasks = recommendations['recommended']
+
+        # Generate markdown section
+        tasks_section = self._generate_daily_tasks_markdown(critical_tasks, recommended_tasks)
+
+        # Read current daily note
+        content = daily_note_path.read_text()
+
+        # Find position for Tasks section (between Planning and Notes)
+        # Check if ## Tasks already exists
+        if '\n## Tasks\n' in content or content.startswith('## Tasks\n'):
+            # Update existing section
+            content = self._update_tasks_section(content, tasks_section)
+        else:
+            # Insert new section
+            content = self._insert_tasks_section(content, tasks_section)
+
+        # Write back to daily note
+        daily_note_path.write_text(content)
+
+        self.logger.info(
+            f"✅ Synced {len(critical_tasks)} critical + {len(recommended_tasks)} recommended tasks to daily note"
+        )
+
+        return True
+
+    def _generate_daily_tasks_markdown(self, critical_tasks: List[Task], recommended_tasks: List[Task]) -> str:
+        """
+        Generate markdown for the ## Tasks section in daily note
+
+        Args:
+            critical_tasks: List of critical tasks
+            recommended_tasks: List of recommended tasks
+
+        Returns:
+            Markdown string for tasks section
+        """
+        import urllib.parse
+
+        lines = ["## Tasks", ""]
+
+        # Get vault name from config (for Obsidian URIs)
+        vault_path = self._obsidian.vault_path
+        vault_name = vault_path.name
+
+        # Critical tasks section
+        if critical_tasks:
+            lines.append(f"### 🚨 Critical ({len(critical_tasks)})")
+            lines.append("")
+
+            for task in critical_tasks:
+                # Checkbox
+                line = f"- [ ] **{task.title}** #{task.priority} #energy/{task.energy} #attention/{task.attention}"
+                lines.append(line)
+
+                # Metadata line
+                meta_parts = []
+                if task.due_date:
+                    days_until = (task.due_date - datetime.now()).days
+                    if days_until < 0:
+                        meta_parts.append(f"**Due**: {task.due_date.strftime('%Y-%m-%d')} (⚠️ OVERDUE by {abs(days_until)} days)")
+                    else:
+                        meta_parts.append(f"**Due**: {task.due_date.strftime('%Y-%m-%d')} (in {days_until} days)")
+
+                meta_parts.append(f"**Tax**: {task.attention_tax:.1f}")
+
+                # Source link
+                if 'obsidian' in task.source_systems:
+                    # Generate Obsidian URI
+                    task_db_path = self._obsidian.task_database.relative_to(vault_path)
+                    encoded_path = urllib.parse.quote(str(task_db_path))
+                    uri = f"obsidian://open?vault={urllib.parse.quote(vault_name)}&file={encoded_path}"
+                    meta_parts.append(f"**Source**: [Tasks]({uri})")
+                else:
+                    source_name = ', '.join(task.source_systems)
+                    meta_parts.append(f"**Source**: {source_name}")
+
+                lines.append(f"  - {' | '.join(meta_parts)}")
+                lines.append("")
+
+        # Recommended tasks section
+        if recommended_tasks:
+            lines.append(f"### 📋 Recommended ({len(recommended_tasks)} capacity-matched)")
+            lines.append("")
+
+            for task in recommended_tasks:
+                # Checkbox
+                line = f"- [ ] **{task.title}** #{task.priority} #energy/{task.energy} #attention/{task.attention}"
+                lines.append(line)
+
+                # Metadata line
+                meta_parts = [f"**Tax**: {task.attention_tax:.1f}"]
+
+                if task.due_date:
+                    meta_parts.append(f"**Due**: {task.due_date.strftime('%Y-%m-%d')}")
+
+                # Source link
+                if 'obsidian' in task.source_systems:
+                    task_db_path = self._obsidian.task_database.relative_to(vault_path)
+                    encoded_path = urllib.parse.quote(str(task_db_path))
+                    uri = f"obsidian://open?vault={urllib.parse.quote(vault_name)}&file={encoded_path}"
+                    meta_parts.append(f"**Source**: [Tasks]({uri})")
+                else:
+                    source_name = ', '.join(task.source_systems)
+                    meta_parts.append(f"**Source**: {source_name}")
+
+                lines.append(f"  - {' | '.join(meta_parts)}")
+                lines.append("")
+
+        if not critical_tasks and not recommended_tasks:
+            lines.append("*No tasks to recommend at this time.*")
+            lines.append("")
+
+        return '\n'.join(lines)
+
+    def _insert_tasks_section(self, content: str, tasks_section: str) -> str:
+        """
+        Insert ## Tasks section between ## Planning and ## Notes
+
+        Args:
+            content: Current daily note content
+            tasks_section: Markdown for tasks section
+
+        Returns:
+            Updated content
+        """
+        import re
+
+        # Try to find ## Planning and ## Notes
+        # Insert Tasks section between them
+        pattern = r'(## Planning.*?)(\n## Notes)'
+        match = re.search(pattern, content, re.DOTALL)
+
+        if match:
+            # Insert between Planning and Notes
+            return content[:match.end(1)] + '\n\n' + tasks_section + '\n' + content[match.end(1):]
+        else:
+            # Fallback: add at end
+            self.logger.warning("Could not find ## Planning and ## Notes sections, appending tasks to end")
+            return content.rstrip() + '\n\n' + tasks_section + '\n'
+
+    def _update_tasks_section(self, content: str, new_tasks_section: str) -> str:
+        """
+        Update existing ## Tasks section, preserving checked boxes
+
+        Args:
+            content: Current daily note content
+            new_tasks_section: New markdown for tasks section
+
+        Returns:
+            Updated content with preserved checkboxes
+        """
+        import re
+
+        # Find the existing ## Tasks section
+        pattern = r'## Tasks\n.*?(?=\n## [^T]|\Z)'
+        match = re.search(pattern, content, re.DOTALL)
+
+        if not match:
+            # No existing section found, insert new one
+            return self._insert_tasks_section(content, new_tasks_section)
+
+        # Extract old section
+        old_section = match.group(0)
+
+        # Find all checked tasks in old section (preserve completions)
+        checked_tasks = set()
+        for line in old_section.split('\n'):
+            if line.strip().startswith('- [x]'):
+                # Extract task title
+                task_match = re.match(r'- \[x\] \*\*(.+?)\*\*', line)
+                if task_match:
+                    checked_tasks.add(task_match.group(1))
+
+        # Update new section to preserve checked boxes
+        new_lines = []
+        for line in new_tasks_section.split('\n'):
+            if line.strip().startswith('- [ ]'):
+                # Check if this task was completed
+                task_match = re.match(r'- \[ \] \*\*(.+?)\*\*', line)
+                if task_match and task_match.group(1) in checked_tasks:
+                    # Mark as checked
+                    line = line.replace('- [ ]', '- [x]', 1)
+            new_lines.append(line)
+
+        updated_section = '\n'.join(new_lines)
+
+        # Replace old section with updated section
+        return content[:match.start()] + updated_section + content[match.end():]
+
+    def sync_completions(self, date: Optional[datetime] = None) -> Dict[str, int]:
+        """
+        Sync checked boxes from daily note to source systems
+
+        Reads the ## Tasks section in daily note, finds all checked boxes,
+        and marks corresponding tasks complete in their source systems.
+
+        Args:
+            date: Date of daily note (default: today)
+
+        Returns:
+            Dict with 'completed' and 'failed' counts
+        """
+        if date is None:
+            date = datetime.now()
+
+        daily_note_path = self._obsidian._get_daily_note_path(date)
+
+        if not daily_note_path.exists():
+            self.logger.error(f"Daily note not found: {daily_note_path}")
+            return {'completed': 0, 'failed': 0}
+
+        self.logger.info(f"Syncing completions from daily note: {daily_note_path.name}")
+
+        # Read daily note
+        content = daily_note_path.read_text()
+
+        # Extract checked tasks from ## Tasks section
+        checked_tasks = self._extract_checked_tasks(content)
+
+        if not checked_tasks:
+            self.logger.info("No checked tasks found in daily note")
+            return {'completed': 0, 'failed': 0}
+
+        self.logger.info(f"Found {len(checked_tasks)} checked tasks")
+
+        # Get all tasks to match against
+        all_tasks = self.aggregate_tasks()
+
+        # Match checked tasks to actual task objects and mark complete
+        completed = 0
+        failed = 0
+
+        for task_title in checked_tasks:
+            # Find matching task
+            matching_task = None
+            for task in all_tasks:
+                if task.title.lower().strip() == task_title.lower().strip():
+                    matching_task = task
+                    break
+
+            if not matching_task:
+                self.logger.warning(f"Could not find task: {task_title[:50]}...")
+                failed += 1
+                continue
+
+            # Mark complete in source systems
+            success = self.mark_complete(matching_task.id)
+            if success:
+                completed += 1
+                self.logger.info(f"✅ Marked complete: {task_title[:50]}...")
+            else:
+                failed += 1
+                self.logger.warning(f"❌ Failed to mark complete: {task_title[:50]}...")
+
+        return {'completed': completed, 'failed': failed}
+
+    def _extract_checked_tasks(self, content: str) -> List[str]:
+        """
+        Extract task titles from checked boxes in ## Tasks section
+
+        Args:
+            content: Full daily note content
+
+        Returns:
+            List of task titles that are checked
+        """
+        import re
+
+        # Find the ## Tasks section
+        pattern = r'## Tasks\n.*?(?=\n## [^T]|\Z)'
+        match = re.search(pattern, content, re.DOTALL)
+
+        if not match:
+            return []
+
+        tasks_section = match.group(0)
+
+        # Find all checked tasks: - [x] **Task Title** ...
+        checked_tasks = []
+        for line in tasks_section.split('\n'):
+            if line.strip().startswith('- [x]'):
+                # Extract task title
+                task_match = re.match(r'- \[x\] \*\*(.+?)\*\*', line)
+                if task_match:
+                    checked_tasks.append(task_match.group(1))
+
+        return checked_tasks
+
+    def sync_dashboard(self) -> bool:
+        """
+        Create/update Task Dashboard in Obsidian vault
+
+        Generates a comprehensive task curation dashboard at:
+        80 - Tasks/Task Dashboard.md
+
+        Dashboard includes all tasks grouped by priority, with full metadata
+        and checkboxes for easy completion/review.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        dashboard_path = self._obsidian.vault_path / "80 - Tasks" / "Task Dashboard.md"
+
+        # Ensure directory exists
+        dashboard_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info(f"Syncing task dashboard: {dashboard_path}")
+
+        # Get all tasks
+        all_tasks = self.aggregate_tasks()
+        deduplicated_tasks = self.deduplicate_tasks(all_tasks)
+
+        # Calculate attention tax and stats
+        for task in deduplicated_tasks:
+            task.attention_tax = self.calculate_attention_tax(task)
+
+        # Generate dashboard markdown
+        dashboard_content = self._generate_dashboard_markdown(deduplicated_tasks)
+
+        # Write to file
+        dashboard_path.write_text(dashboard_content)
+
+        self.logger.info(f"✅ Dashboard updated with {len(deduplicated_tasks)} tasks")
+
+        return True
+
+    def _generate_dashboard_markdown(self, tasks: List[Task]) -> str:
+        """
+        Generate markdown for Task Dashboard
+
+        Args:
+            tasks: All tasks (deduplicated)
+
+        Returns:
+            Markdown string for dashboard
+        """
+        import urllib.parse
+
+        lines = ["# Task Dashboard", ""]
+
+        # Get vault name from config (for Obsidian URIs)
+        vault_path = self._obsidian.vault_path
+        vault_name = vault_path.name
+
+        # Stats header
+        now = datetime.now()
+        critical_tasks = self._identify_critical_tasks(tasks)
+        overdue_tasks = [t for t in tasks if t.due_date and t.due_date < now]
+
+        lines.append(f"*Last updated: {now.strftime('%Y-%m-%d %H:%M')}*")
+        lines.append(f"*Total: {len(tasks)} tasks | Critical: {len(critical_tasks)} | Overdue: {len(overdue_tasks)}*")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        # Group tasks by priority
+        by_priority = {
+            'P1': [],
+            'P2': [],
+            'P3': [],
+            'P4': []
+        }
+
+        for task in tasks:
+            priority = task.priority
+            if priority in by_priority:
+                by_priority[priority].append(task)
+
+        # Generate sections for each priority
+        priority_labels = {
+            'P1': '🔴 P1 Tasks (Urgent)',
+            'P2': '🟡 P2 Tasks (High)',
+            'P3': '🟢 P3 Tasks (Normal)',
+            'P4': '🔵 P4 Tasks (Low)'
+        }
+
+        for priority in ['P1', 'P2', 'P3', 'P4']:
+            priority_tasks = by_priority[priority]
+
+            if not priority_tasks:
+                continue
+
+            lines.append(f"## {priority_labels[priority]} ({len(priority_tasks)})")
+            lines.append("")
+
+            # Group by source within priority
+            by_source = {}
+            for task in priority_tasks:
+                for source in task.source_systems:
+                    if source not in by_source:
+                        by_source[source] = []
+                    by_source[source].append(task)
+
+            # Sort sources
+            for source in sorted(by_source.keys()):
+                source_tasks = by_source[source]
+                lines.append(f"### {source.capitalize()} ({len(source_tasks)} tasks)")
+                lines.append("")
+
+                # Sort by attention tax
+                source_tasks.sort(key=lambda t: t.attention_tax)
+
+                for task in source_tasks:
+                    # Checkbox and title
+                    lines.append(f"- [ ] **{task.title}** #energy/{task.energy} #attention/{task.attention}")
+
+                    # Metadata line
+                    meta_parts = [f"Tax: {task.attention_tax:.1f}"]
+
+                    if task.due_date:
+                        days_until = (task.due_date - now).days
+                        if days_until < 0:
+                            meta_parts.append(f"Due: {task.due_date.strftime('%Y-%m-%d')} (⚠️ OVERDUE by {abs(days_until)} days)")
+                        elif days_until <= 7:
+                            meta_parts.append(f"Due: {task.due_date.strftime('%Y-%m-%d')} (in {days_until} days)")
+                        else:
+                            meta_parts.append(f"Due: {task.due_date.strftime('%Y-%m-%d')}")
+
+                    # Source link (if Obsidian)
+                    if 'obsidian' in task.source_systems:
+                        task_db_path = self._obsidian.task_database.relative_to(vault_path)
+                        encoded_path = urllib.parse.quote(str(task_db_path))
+                        uri = f"obsidian://open?vault={urllib.parse.quote(vault_name)}&file={encoded_path}"
+                        meta_parts.append(f"[View]({uri})")
+
+                    if len(task.source_systems) > 1:
+                        other_sources = [s for s in task.source_systems if s != source]
+                        meta_parts.append(f"Also in: {', '.join(other_sources)}")
+
+                    lines.append(f"  - {' | '.join(meta_parts)}")
+                    lines.append("")
+
+            lines.append("")
+
+        return '\n'.join(lines)
+
     def cleanup_stale_tasks(self, stale_threshold_days: Optional[int] = None) -> List[Task]:
         """
         Find stale tasks that may need review
@@ -691,7 +1155,7 @@ def main():
     )
     parser.add_argument(
         'command',
-        choices=['recommend', 'list', 'status', 'complete', 'cleanup'],
+        choices=['recommend', 'list', 'status', 'complete', 'cleanup', 'sync-daily', 'sync-dashboard', 'sync-completions'],
         help='Command to execute'
     )
     parser.add_argument(
@@ -953,6 +1417,38 @@ def main():
                 print(f"   Attention Tax: {task.attention_tax:.1f}")
                 print(f"   Sources: {', '.join(task.source_systems)}")
                 print()
+
+    elif args.command == 'sync-daily':
+        success = agent.sync_daily_note()
+        if success:
+            print("✅ Tasks synced to today's daily note")
+        else:
+            print("❌ Failed to sync tasks to daily note")
+            return 1
+
+    elif args.command == 'sync-dashboard':
+        success = agent.sync_dashboard()
+        if success:
+            print("✅ Task Dashboard updated at 80 - Tasks/Task Dashboard.md")
+        else:
+            print("❌ Failed to update Task Dashboard")
+            return 1
+
+    elif args.command == 'sync-completions':
+        result = agent.sync_completions()
+        completed = result['completed']
+        failed = result['failed']
+
+        print(f"\n✅ Completion Sync Results:")
+        print(f"   Completed: {completed} tasks")
+        print(f"   Failed: {failed} tasks")
+
+        if completed > 0:
+            print(f"\n✨ {completed} task(s) marked complete in source systems")
+        if failed > 0:
+            print(f"\n⚠️  {failed} task(s) could not be marked complete")
+
+        return 0 if failed == 0 else 1
 
     return 0
 
