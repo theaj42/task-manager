@@ -228,16 +228,18 @@ class TaskManager:
         self,
         capacity: Optional[Capacity] = None,
         max_tasks: Optional[int] = None
-    ) -> List[Task]:
+    ) -> Dict[str, List[Task]]:
         """
-        Recommend tasks matching current capacity
+        Recommend tasks with separate critical and capacity-matched sections
 
         Args:
             capacity: Current energy/attention (if None, will read from daily note)
-            max_tasks: Maximum tasks to return (default from config)
+            max_tasks: Maximum tasks to return in recommended section (default from config)
 
         Returns:
-            List of recommended tasks sorted by Attention Tax, filtered by capacity match
+            Dict with 'critical' and 'recommended' lists:
+            - critical: Urgent tasks regardless of capacity (due soon, blockers, P1 deadlines)
+            - recommended: Capacity-matched tasks sorted by lowest Attention Tax first
         """
         if capacity is None:
             capacity = self.get_current_capacity()
@@ -258,53 +260,65 @@ class TaskManager:
         for task in all_tasks:
             task.attention_tax = self.calculate_attention_tax(task)
 
-        # Filter by capacity match
-        matched_tasks = self._filter_by_capacity(all_tasks, capacity)
+        # Identify critical tasks (overrides capacity)
+        critical_tasks = self._identify_critical_tasks(all_tasks)
+        self.logger.info(f"Found {len(critical_tasks)} critical tasks")
+
+        # Filter by capacity match (excluding already-critical tasks)
+        non_critical = [t for t in all_tasks if t not in critical_tasks]
+        matched_tasks = self._filter_by_capacity(non_critical, capacity)
 
         self.logger.info(
             f"Filtered to {len(matched_tasks)} tasks matching capacity "
-            f"(from {len(all_tasks)} total)"
+            f"(from {len(non_critical)} non-critical tasks)"
         )
 
-        # Sort by Attention Tax (highest first)
-        matched_tasks.sort(key=lambda t: t.attention_tax, reverse=True)
+        # Sort by Attention Tax (LOWEST first - easiest wins when tired)
+        matched_tasks.sort(key=lambda t: t.attention_tax)
 
         # Return top N
         min_tasks = self.config['recommendations']['min_tasks']
         recommendations = matched_tasks[:max_tasks]
 
-        # If we don't have enough matches, fill with highest priority regardless of capacity
+        # If we don't have enough matches, fill with lowest-tax tasks regardless of capacity
         if len(recommendations) < min_tasks:
             self.logger.info(
                 f"Only {len(recommendations)} capacity matches, "
-                f"adding high-priority tasks to reach minimum of {min_tasks}"
+                f"adding low-tax tasks to reach minimum of {min_tasks}"
             )
-            all_tasks.sort(key=lambda t: t.attention_tax, reverse=True)
-            for task in all_tasks:
+            non_critical.sort(key=lambda t: t.attention_tax)
+            for task in non_critical:
                 if task not in recommendations:
                     recommendations.append(task)
                     if len(recommendations) >= min_tasks:
                         break
 
-        self.logger.info(f"Recommended {len(recommendations)} tasks")
-        return recommendations
+        self.logger.info(
+            f"Returning {len(critical_tasks)} critical + "
+            f"{len(recommendations)} recommended tasks"
+        )
+
+        return {
+            'critical': critical_tasks,
+            'recommended': recommendations
+        }
 
     def _filter_by_capacity(self, tasks: List[Task], capacity: Capacity) -> List[Task]:
         """
-        Filter tasks to those matching current energy/attention capacity
+        Filter tasks to those AT OR BELOW current energy/attention capacity
 
-        Strategy:
-        - Exact match (same energy AND attention): highest priority
-        - Energy match OR attention match: medium priority
-        - No match but one level off: acceptable
-        - Two levels off: exclude
+        Strategy (STRICT):
+        - Only show tasks you can actually handle at current capacity
+        - Task requirement must be <= your capacity in both dimensions
+        - Example: If you're at low/low, only show low/low tasks
+        - Example: If you're at medium/high, show low/medium, low/high, medium/medium, medium/high
 
         Args:
             tasks: List of all tasks
             capacity: Current capacity
 
         Returns:
-            Tasks that match or are close to current capacity
+            Tasks that are at or below current capacity
         """
         energy_levels = {'low': 0, 'medium': 1, 'high': 2}
         attention_levels = {'low': 0, 'medium': 1, 'high': 2}
@@ -318,15 +332,10 @@ class TaskManager:
             task_energy_level = energy_levels[task.energy]
             task_attention_level = attention_levels[task.attention]
 
-            # Calculate distance from current capacity
-            energy_diff = abs(task_energy_level - capacity_energy_level)
-            attention_diff = abs(task_attention_level - capacity_attention_level)
-
-            # Accept if:
-            # - Exact match (diff = 0 for both)
-            # - One dimension matches and other is within 1 level
-            # - Both within 1 level
-            if energy_diff <= 1 and attention_diff <= 1:
+            # STRICT: Task requirements must be <= your capacity
+            # Don't show tasks that require MORE than you have
+            if (task_energy_level <= capacity_energy_level and
+                task_attention_level <= capacity_attention_level):
                 matched.append(task)
                 self.logger.debug(
                     f"Match: '{task.title[:30]}' "
@@ -335,6 +344,75 @@ class TaskManager:
                 )
 
         return matched
+
+    def _identify_critical_tasks(self, tasks: List[Task]) -> List[Task]:
+        """
+        Identify critical/urgent tasks that override capacity filtering
+
+        Criteria for critical:
+        - Due within configured days threshold (default: 2 days)
+        - P1 tasks with deadlines
+        - Contains urgent keywords (urgent, asap, critical, blocker, blocking)
+        - Has critical tags (urgency/high, importance/high)
+
+        Args:
+            tasks: All tasks to evaluate
+
+        Returns:
+            List of critical tasks sorted by due date (soonest first)
+        """
+        config = self.config['critical_tasks']
+        critical = []
+        now = datetime.now()
+
+        for task in tasks:
+            is_critical = False
+            reasons = []
+
+            # Check due date
+            if task.due_date:
+                days_until_due = (task.due_date - now).days
+                if days_until_due <= config['due_within_days']:
+                    is_critical = True
+                    reasons.append(f"due in {days_until_due} days")
+
+            # Check P1 with deadline
+            if (config['p1_with_deadline_critical'] and
+                task.priority == 'P1' and
+                task.due_date):
+                is_critical = True
+                reasons.append("P1 with deadline")
+
+            # Check urgent keywords in title
+            title_lower = task.title.lower()
+            for keyword in config['urgent_keywords']:
+                if keyword in title_lower:
+                    is_critical = True
+                    reasons.append(f"contains '{keyword}'")
+                    break
+
+            # Check critical tags in metadata
+            if task.metadata and 'raw_line' in task.metadata:
+                raw_line = task.metadata['raw_line']
+                for tag in config['critical_tags']:
+                    if f'#{tag}' in raw_line:
+                        is_critical = True
+                        reasons.append(f"has #{tag}")
+                        break
+
+            if is_critical:
+                self.logger.info(
+                    f"Critical task: '{task.title[:40]}' - {', '.join(reasons)}"
+                )
+                critical.append(task)
+
+        # Sort critical tasks by due date (soonest first)
+        critical.sort(key=lambda t: (
+            t.due_date if t.due_date else datetime.max,
+            -t.attention_tax  # Secondary sort by tax if same due date
+        ))
+
+        return critical
 
     def mark_complete(self, task_id: str, systems: Optional[List[str]] = None) -> bool:
         """
@@ -461,12 +539,42 @@ def main():
 
     # Execute command
     if args.command == 'recommend':
-        recommendations = agent.recommend_next_actions(max_tasks=args.max_tasks)
-        print(f"\n📋 Recommended Tasks ({len(recommendations)}):\n")
-        for i, task in enumerate(recommendations, 1):
+        result = agent.recommend_next_actions(max_tasks=args.max_tasks)
+        critical_tasks = result['critical']
+        recommended_tasks = result['recommended']
+
+        # Show critical tasks first (if any)
+        if critical_tasks:
+            print(f"\n🚨 CRITICAL TASKS ({len(critical_tasks)}):")
+            print("=" * 60)
+            for i, task in enumerate(critical_tasks, 1):
+                print(f"\n{i}. [{task.priority}] {task.title}")
+                print(f"   Attention Tax: {task.attention_tax:.1f}")
+                print(f"   Energy: {task.energy}, Attention: {task.attention}")
+                if task.due_date:
+                    days_until = (task.due_date - datetime.now()).days
+                    if days_until < 0:
+                        print(f"   Due: {task.due_date.strftime('%Y-%m-%d')} (⚠️  OVERDUE by {abs(days_until)} days)")
+                    elif days_until == 0:
+                        print(f"   Due: {task.due_date.strftime('%Y-%m-%d')} (⚠️  DUE TODAY)")
+                    elif days_until == 1:
+                        print(f"   Due: {task.due_date.strftime('%Y-%m-%d')} (DUE TOMORROW)")
+                    else:
+                        print(f"   Due: {task.due_date.strftime('%Y-%m-%d')} (in {days_until} days)")
+                print(f"   Sources: {', '.join(task.source_systems)}")
+        else:
+            print(f"\n✅ No critical tasks - great!")
+
+        # Show capacity-matched recommendations
+        print(f"\n\n📋 RECOMMENDED TASKS ({len(recommended_tasks)}):")
+        print("=" * 60)
+        print("(Sorted by Attention Tax: lowest first = easiest wins)\n")
+        for i, task in enumerate(recommended_tasks, 1):
             print(f"{i}. [{task.priority}] {task.title}")
             print(f"   Attention Tax: {task.attention_tax:.1f}")
             print(f"   Energy: {task.energy}, Attention: {task.attention}")
+            if task.due_date:
+                print(f"   Due: {task.due_date.strftime('%Y-%m-%d')}")
             print(f"   Sources: {', '.join(task.source_systems)}")
             print()
 
